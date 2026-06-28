@@ -36,7 +36,13 @@ const DEFAULTS: DeploySpecInput = {
   failureMode: 'none',
 };
 
-export function DeployForm({ onCreated }: { onCreated: (id: string) => void }) {
+export function DeployForm({
+  onCreated,
+  canDeploy,
+}: {
+  onCreated: (id: string) => void;
+  canDeploy: boolean;
+}) {
   const [form, setForm] = useState<DeploySpecInput>(DEFAULTS);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -169,7 +175,13 @@ export function DeployForm({ onCreated }: { onCreated: (id: string) => void }) {
 
         {error && <div className="errbox">{error}</div>}
 
-        <button className="primary" type="submit" disabled={busy}>
+        {!canDeploy && (
+          <div className="hint" style={{ marginTop: 10 }}>
+            Your role is read-only. Sign in as DevOps Engineer or Platform Team to trigger deployments.
+          </div>
+        )}
+
+        <button className="primary" type="submit" disabled={busy || !canDeploy}>
           {busy ? 'Submitting…' : 'Deploy'}
         </button>
       </div>

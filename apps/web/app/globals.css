@@ -375,6 +375,33 @@ pre.manifest {
   color: var(--idle);
   font-size: 13px;
 }
+
+/* ---- login ---- */
+.login-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  min-height: 100vh;
+}
+.login-card {
+  width: 360px;
+  max-width: 92vw;
+}
+.linkbtn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--mono);
+}
+.linkbtn:hover {
+  color: var(--text);
+  border-color: var(--muted);
+}
 .sectlabel {
   font-size: 11px;
   text-transform: uppercase;
