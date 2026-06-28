@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
 import {
+  asRunId,
   DeploymentSpecSchema,
   type OrchestrationEngine,
   type Run,
@@ -23,7 +24,7 @@ const isTerminal = (status: Run['status']): boolean =>
 export function createApp({ store, engine }: AppDeps): Hono {
   const app = new Hono();
 
-  // The operator console is served from a different origin (Next on :3000).
+  // The operator console (and the CLI) are separate origins — allow them.
   app.use('/api/*', cors());
 
   app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
@@ -46,17 +47,26 @@ export function createApp({ store, engine }: AppDeps): Hono {
     return c.json(run, 202);
   });
 
-  // Fetch a single run's full state (polling fallback for the UI).
+  // Fetch a single run's full state (polling fallback for the UI and CLI).
   app.get('/api/deployments/:id', (c) => {
-    const run = store.get(c.req.param('id'));
+    const run = store.get(asRunId(c.req.param('id')));
     if (!run) return c.json({ error: 'run not found' }, 404);
     return c.json(run);
+  });
+
+  // The rendered Deployment manifest as raw YAML — the GitOps artifact, also
+  // handy for `kdo` CLI users and CI to diff/commit.
+  app.get('/api/deployments/:id/manifest', (c) => {
+    const run = store.get(asRunId(c.req.param('id')));
+    if (!run) return c.json({ error: 'run not found' }, 404);
+    if (!run.manifest) return c.json({ error: 'manifest not rendered yet' }, 409);
+    return c.body(run.manifest, 200, { 'content-type': 'application/yaml' });
   });
 
   // Live progress: Server-Sent Events. Coalesces rapid state changes into at
   // most one frame per tick to keep writes ordered and the stream cheap.
   app.get('/api/deployments/:id/events', (c) => {
-    const id = c.req.param('id');
+    const id = asRunId(c.req.param('id'));
     if (!store.get(id)) return c.json({ error: 'run not found' }, 404);
 
     return streamSSE(c, async (stream) => {
