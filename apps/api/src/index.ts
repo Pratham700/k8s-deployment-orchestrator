@@ -12,6 +12,5 @@ const app = createApp({ store, engine });
 const port = Number(process.env.PORT ?? 3001);
 
 serve({ fetch: app.fetch, port }, (info) => {
-  // eslint-disable-next-line no-console
   console.log(`kdo-api listening on http://localhost:${info.port}`);
 });
