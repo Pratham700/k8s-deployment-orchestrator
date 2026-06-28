@@ -124,7 +124,9 @@ pnpm install          # install workspace deps
 pnpm dev              # starts the API (:3001) and the web console (:3000) together
 ```
 
-Then open **http://localhost:3000** and click **Deploy**.
+Then open **http://localhost:3000**. The login form pre-fills the demo API key — pick a role
+(start with **Platform Team**) and sign in, then click **Deploy**. See [Authentication &
+RBAC](#authentication--rbac-deliberately-simple).
 
 > `pnpm dev` runs both apps via `nx run-many`. To run them separately:
 > `pnpm --filter @kdo/api dev` and `pnpm --filter @kdo/web dev`.
@@ -143,14 +145,19 @@ pnpm lint             # ESLint v9 flat config
 
 Base URL: `http://localhost:3001`
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/health` | liveness probe |
-| `GET` | `/api/deployments` | list runs (newest first) |
-| `POST` | `/api/deployments` | submit a spec → `202` with the created run (executes async) |
-| `GET` | `/api/deployments/:id` | full run state (polling fallback) |
-| `GET` | `/api/deployments/:id/manifest` | rendered Deployment YAML (the GitOps artifact) |
-| `GET` | `/api/deployments/:id/events` | **SSE** stream of live run state; emits a terminal `done` event |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/health` | public | liveness probe |
+| `POST` | `/api/auth/login` | public | exchange `{apiKey, role}` for a session token |
+| `GET` | `/api/auth/me` | any role | current role + permissions |
+| `GET` | `/api/deployments` | any role | list runs (newest first) |
+| `POST` | `/api/deployments` | `deployments:create` | submit a spec → `202` with the created run (executes async) |
+| `GET` | `/api/deployments/:id` | any role | full run state (polling fallback) |
+| `GET` | `/api/deployments/:id/manifest` | any role | rendered Deployment YAML (the GitOps artifact) |
+| `GET` | `/api/deployments/:id/events` | any role | **SSE** stream of live run state; emits a terminal `done` event |
+
+Authenticated routes expect `Authorization: Bearer <token>` (the SSE route also accepts `?token=`
+since `EventSource` can't set headers). Missing/invalid token → `401`; insufficient role → `403`.
 
 **Submit a deployment:**
 
@@ -162,6 +169,29 @@ curl -X POST localhost:3001/api/deployments \
 
 An invalid spec returns `400` with structured Zod issues (e.g. an image without an explicit tag,
 replicas outside `1..10`, or a non-DNS-1123 name).
+
+## Authentication & RBAC (deliberately simple)
+
+A thin auth layer demonstrates the platform-RBAC concern of *who may trigger a deploy vs. who only
+observes* — without standing up a real identity provider (which the assignment doesn't require). It's
+**demo-only**: one shared API key, a fixed role catalogue, and in-memory sessions.
+
+- **Login**: `POST /api/auth/login` with the shared key + a role returns an opaque session token.
+- **Roles & permissions**:
+
+  | Role | View | Trigger deploys |
+  |---|---|---|
+  | Platform Team | ✅ | ✅ |
+  | DevOps Engineer | ✅ | ✅ |
+  | Engineering Manager | ✅ | ❌ (read-only) |
+
+- **Zero-friction evaluation**: the login form pre-fills the dev key (`kdo-dev-key-2026`) — just pick a
+  role and sign in. Try **Engineering Manager** to see the Deploy button disabled and `POST` return
+  `403`. Override the key with `KDO_API_KEY`.
+
+> Not production auth: no token signing/expiry, no password store, sessions reset on API restart. The
+> seam (`requireAuth` / `requirePermission` middleware, role→permission map) is what a real
+> OIDC/JWT integration would slot into.
 
 ## CLI — config-file driven (for engineers & CI)
 
@@ -185,9 +215,10 @@ pnpm kdo apply -f examples/deployments.yaml
 ✓ all 3 deployment(s) succeeded
 ```
 
-Flags: `--api <url>` (or `$KDO_API`), `--json` (machine-readable output), `--no-follow` (fire and
-exit). **Exit codes:** `0` all succeeded · `1` a rollout failed/rolled back · `2` usage/connection
-error — so `kdo apply` drops straight into a CI gate.
+Flags: `--api <url>` (or `$KDO_API`), `--api-key <key>` (or `$KDO_API_KEY`, defaults to the dev key),
+`--role <role>` (default `devops-engineer`), `--json` (machine-readable output), `--no-follow` (fire
+and exit). The CLI logs in for a token before submitting. **Exit codes:** `0` all succeeded · `1` a
+rollout failed/rolled back · `2` usage/auth/connection error — so `kdo apply` drops into a CI gate.
 
 ## Project structure
 

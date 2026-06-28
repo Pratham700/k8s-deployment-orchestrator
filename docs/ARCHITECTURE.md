@@ -181,7 +181,29 @@ submits each deployment, and polls to a terminal state, printing steps as they s
 (all succeeded), `1` (a rollout failed/rolled back), or `2` (usage/connection) so it fits a CI gate.
 Keeping the API as the single control plane is what makes the UI and CLI behave identically.
 
-## 8. Type safety
+## 8. Authentication & RBAC (demo-only)
+
+A thin layer demonstrates platform RBAC — *who may trigger a deploy vs. who only observes* — without a
+real IdP (out of scope for the assignment). The pieces:
+
+- **Roles & permissions live in `@kdo/core`** (`ROLES`, `ROLE_PERMISSIONS`, `roleHasPermission`) — a
+  pure data model shared by the API (enforcement) and reused conceptually by the UI/CLI.
+  `engineering-manager` holds only `deployments:read`; `devops-engineer` and `platform-team` also hold
+  `deployments:create`.
+- **One shared API key** (`KDO_API_KEY`, default `kdo-dev-key-2026`) exchanged at `POST
+  /api/auth/login` for an opaque session token; the API holds a `Map<token, role>` (same in-memory,
+  reset-on-restart shape as the RunStore).
+- **Two middlewares** (`apps/api/src/auth.ts`): `requireAuth` (valid token → attaches `role` to the
+  Hono context) guards every `/api/deployments*` route; `requirePermission('deployments:create')`
+  gates `POST /api/deployments`. The SSE route reads the token from `?token=` because `EventSource`
+  can't send headers.
+- **Defence in depth in the UI**: the read-only role sees the Deploy button disabled *and* the API
+  returns `403` if it tries anyway.
+
+This is explicitly *not* production auth (no signing/expiry/hashing). The value is the **seam**: swap
+the login handler + `requireAuth` for OIDC/JWT and the role→permission map is unchanged.
+
+## 9. Type safety
 
 - **Branded `RunId`** (`string & { __brand }`) — a plain string can't be passed where a run id is
   expected; `asRunId()` is the one sanctioned crossing point, used at the HTTP boundary.
@@ -194,10 +216,12 @@ Keeping the API as the single control plane is what makes the UI and CLI behave 
 - **Compiler**: `strict`, `noUncheckedIndexedAccess`, `noImplicitReturns`,
   `noFallthroughCasesInSwitch`, `noUnusedLocals/Parameters`.
 
-## 9. Testing strategy
+## 10. Testing strategy
 
-- **Engine** (`packages/core/src/engine.test.ts`, 12 tests) — happy path, Recreate, all three failure
-  modes, rollback-to-previous-revision, Canary plan logging, manifest annotations, and spec validation.
-- **API** (`apps/api/src/app.test.ts`) — health, `400` validation, `202` + drive-to-success, `404`.
+- **Engine + auth** (`packages/core`, 15 tests) — happy path, Recreate, all three failure modes,
+  rollback-to-previous-revision, Canary plan logging, manifest annotations, spec validation, and the
+  role→permission matrix.
+- **API** (`apps/api/src/app.test.ts`, 8 tests) — health, login (valid/bad key/bad role),
+  unauthenticated `401`, RBAC `403` for a manager + `202` for platform-team, `400` validation, `404`.
 - **CLI** (`apps/cli/src/config.test.ts`) — config parsing, schema defaults, invalid-canary rejection.
 - **Determinism** comes from the tick-based cluster + injectable `Timing`: no sleeps, no flakes.
