@@ -142,4 +142,4 @@ If I kept going, the next steps would be a real `kind`-cluster driver, then an A
 then the canary traffic mechanics. The interfaces for all three already exist.
 
 This project was built with AI assistance, which the brief required. The full interaction log, showing
-what I directed versus delegated, is in [AI_LOG.md](AI_LOG.md).
+what I directed versus delegated, is in [docs/ai_transcript.jsonl](docs/ai_transcript.jsonl).
