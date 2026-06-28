@@ -1,10 +1,12 @@
 #!/usr/bin/env -S npx tsx
 import { z } from 'zod';
-import type { Run, Step } from '@kdo/core';
+import { isRole, type Role, type Run, type Step } from '@kdo/core';
 import { loadConfig } from './config';
-import { ApiError, checkHealth, getRun, submitDeployment } from './client';
+import { ApiError, checkHealth, getRun, login, submitDeployment } from './client';
 
 const DEFAULT_API = process.env.KDO_API ?? 'http://localhost:3001';
+const DEFAULT_API_KEY = process.env.KDO_API_KEY ?? 'kdo-dev-key-2026';
+const DEFAULT_ROLE: Role = 'devops-engineer';
 const TERMINAL = new Set<Run['status']>(['succeeded', 'failed', 'rolled_back']);
 
 // -- tiny ANSI helper (respects NO_COLOR / non-TTY) -------------------------
@@ -24,6 +26,8 @@ interface Args {
   command?: string;
   file?: string;
   api?: string;
+  apiKey?: string;
+  role?: string;
   json: boolean;
   follow: boolean;
   help: boolean;
@@ -38,6 +42,8 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--no-follow') args.follow = false;
     else if (a === '-f' || a === '--file') args.file = argv[++i];
     else if (a === '--api') args.api = argv[++i];
+    else if (a === '--api-key') args.apiKey = argv[++i];
+    else if (a === '--role') args.role = argv[++i];
     else if (a !== undefined && !a.startsWith('-') && !args.command) args.command = a;
   }
   return args;
@@ -51,6 +57,9 @@ Usage:
 Options:
   -f, --file <path>   YAML config declaring one or more deployments (required)
   --api <url>         API base URL (default: $KDO_API or http://localhost:3001)
+  --api-key <key>     shared API key (default: $KDO_API_KEY or the dev key)
+  --role <role>       engineering-manager | devops-engineer | platform-team
+                      (default: devops-engineer)
   --no-follow         submit and exit without waiting for terminal state
   --json              print the final run objects as JSON
   -h, --help          show this help
@@ -75,13 +84,13 @@ function printStep(step: Step): void {
 }
 
 /** Poll a run to completion, printing steps as they settle. */
-async function follow(apiBase: string, initial: Run): Promise<Run> {
+async function follow(apiBase: string, token: string, initial: Run): Promise<Run> {
   const printed = new Set<string>();
   let run = initial;
   let transientErrors = 0;
   for (;;) {
     try {
-      run = await getRun(apiBase, run.id);
+      run = await getRun(apiBase, token, run.id);
       transientErrors = 0;
     } catch (err) {
       // Tolerate the occasional transient network blip while polling.
@@ -132,14 +141,19 @@ async function apply(args: Args): Promise<number> {
   }
 
   const apiBase = args.api ?? config.apiBaseUrl ?? DEFAULT_API;
+  const apiKey = args.apiKey ?? config.apiKey ?? DEFAULT_API_KEY;
+  const role: Role = isRole(args.role) ? args.role : (config.role ?? DEFAULT_ROLE);
+
+  let token: string;
   try {
     await checkHealth(apiBase);
+    token = await login(apiBase, apiKey, role);
   } catch (err) {
     console.error(c.red(err instanceof ApiError ? err.message : String(err)));
     return 2;
   }
 
-  console.log(c.dim(`api: ${apiBase} · ${config.deployments.length} deployment(s)\n`));
+  console.log(c.dim(`api: ${apiBase} · role: ${role} · ${config.deployments.length} deployment(s)\n`));
 
   const results: Run[] = [];
   for (const spec of config.deployments) {
@@ -147,13 +161,13 @@ async function apply(args: Args): Promise<number> {
       c.bold(`▶ ${spec.namespace}/${spec.name}`) + c.dim(` (${spec.image}, ${spec.strategy.kind})`),
     );
     try {
-      const submitted = await submitDeployment(apiBase, spec);
+      const submitted = await submitDeployment(apiBase, token, spec);
       if (!args.follow) {
         console.log(c.dim(`  submitted: ${submitted.id}`));
         results.push(submitted);
         continue;
       }
-      const final = await follow(apiBase, submitted);
+      const final = await follow(apiBase, token, submitted);
       console.log(`  ${statusLabel(final.status)} — ${final.message ?? ''}\n`);
       results.push(final);
     } catch (err) {

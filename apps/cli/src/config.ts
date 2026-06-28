@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { DeploymentSpecSchema } from '@kdo/core';
+import { DeploymentSpecSchema, ROLES } from '@kdo/core';
 
 /**
  * A `kdo` config file declares one or more deployments. It reuses the *same*
@@ -10,6 +10,9 @@ import { DeploymentSpecSchema } from '@kdo/core';
  */
 export const ConfigSchema = z.object({
   apiBaseUrl: z.string().url().optional(),
+  /** Auth (optional in the file; usually supplied via flags/env). */
+  apiKey: z.string().optional(),
+  role: z.enum(ROLES).optional(),
   deployments: z.array(DeploymentSpecSchema).min(1, 'config must declare at least one deployment'),
 });
 
