@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import type { Run } from './types';
+import type { Run, RunId } from './types';
 
 /**
  * In-memory run store with a pub/sub channel.
@@ -10,7 +10,7 @@ import type { Run } from './types';
  * swap this for Postgres/Redis behind the same small interface.
  */
 export class RunStore {
-  private readonly runs = new Map<string, Run>();
+  private readonly runs = new Map<RunId, Run>();
   private readonly emitter = new EventEmitter();
 
   constructor() {
@@ -23,7 +23,7 @@ export class RunStore {
     this.emitter.emit(run.id, run);
   }
 
-  get(id: string): Run | undefined {
+  get(id: RunId): Run | undefined {
     return this.runs.get(id);
   }
 
@@ -32,7 +32,7 @@ export class RunStore {
   }
 
   /** Stamp the run as updated and notify subscribers. */
-  touch(id: string): void {
+  touch(id: RunId): void {
     const run = this.runs.get(id);
     if (!run) return;
     run.updatedAt = new Date().toISOString();
@@ -40,7 +40,7 @@ export class RunStore {
   }
 
   /** Subscribe to updates for a single run. Returns an unsubscribe function. */
-  subscribe(id: string, listener: (run: Run) => void): () => void {
+  subscribe(id: RunId, listener: (run: Run) => void): () => void {
     this.emitter.on(id, listener);
     return () => {
       this.emitter.off(id, listener);

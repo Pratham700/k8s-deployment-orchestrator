@@ -1,13 +1,20 @@
 import { randomUUID } from 'node:crypto';
-import { RolloutError, SimulatedCluster } from './cluster';
+import { RolloutError } from './cluster';
 import { renderDeploymentManifest } from './manifest';
 import type { RunStore } from './store';
+import { errorMessage } from './util';
 import {
+  asRunId,
+  type ClusterDriver,
   DEFAULT_TIMING,
   type DeploymentSpec,
+  type Pod,
+  type RolloutPacing,
   type Run,
+  type RunId,
   type Step,
   type StepId,
+  STRATEGY_REGISTRY,
   type Timing,
 } from './types';
 
@@ -29,16 +36,16 @@ const now = (): string => new Date().toISOString();
 const clock = (): string => new Date().toISOString().slice(11, 19);
 
 /**
- * Drives a deployment spec through the orchestration workflow against the
- * simulated cluster, persisting every state transition to the RunStore so the
- * API/UI can observe progress live and react to success or failure.
+ * Drives a deployment spec through the orchestration workflow against a
+ * {@link ClusterDriver}, persisting every state transition to the RunStore so
+ * the API/UI can observe progress live and react to success or failure.
  */
 export class OrchestrationEngine {
   /** Monotonic revision counter per namespace/name. */
   private readonly revisions = new Map<string, number>();
 
   constructor(
-    private readonly cluster: SimulatedCluster,
+    private readonly cluster: ClusterDriver,
     private readonly store: RunStore,
     private readonly timing: Timing = DEFAULT_TIMING,
   ) {}
@@ -49,12 +56,13 @@ export class OrchestrationEngine {
     const revision = (this.revisions.get(key) ?? 0) + 1;
     this.revisions.set(key, revision);
 
+    const previousRevision = this.cluster.stableRevision(spec.namespace, spec.name);
     const run: Run = {
-      id: `dep-${randomUUID().slice(0, 8)}`,
+      id: asRunId(`dep-${randomUUID().slice(0, 8)}`),
       spec,
       status: 'pending',
       revision,
-      previousRevision: this.cluster.stableRevision(spec.namespace, spec.name),
+      ...(previousRevision !== undefined ? { previousRevision } : {}),
       steps: STEP_DEFS.map(({ id, name }) => ({ id, name, status: 'pending', logs: [] })),
       createdAt: now(),
       updatedAt: now(),
@@ -64,10 +72,11 @@ export class OrchestrationEngine {
   }
 
   /** Execute the workflow for a previously-created run. Never rejects. */
-  async execute(runId: string): Promise<void> {
+  async execute(runId: RunId): Promise<void> {
     const run = this.store.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     const { namespace, name } = run.spec;
+    const strategy = STRATEGY_REGISTRY[run.spec.strategy.kind];
 
     run.status = 'running';
     this.store.touch(run.id);
@@ -77,7 +86,10 @@ export class OrchestrationEngine {
         const s = run.spec;
         log(`name=${s.name} namespace=${s.namespace} replicas=${s.replicas}`);
         log(`image=${s.image} (explicit tag present)`);
-        log(`strategy=${s.strategy}`);
+        log(`strategy=${strategy.label}`);
+        if (!strategy.executable) {
+          log('strategy mechanics are planned — rollout will use a progressive bring-up');
+        }
         if (s.failureMode !== 'none') log(`failure injection enabled: ${s.failureMode}`);
         log('spec is valid');
       });
@@ -94,10 +106,11 @@ export class OrchestrationEngine {
       });
 
       await this.step(run, 'apply', async (log) => {
-        this.cluster.applyDeployment(run.spec, run.revision);
+        const pacing: RolloutPacing = strategy.pacing;
+        this.cluster.applyDeployment(run.spec, run.revision, pacing);
         run.rollout = this.cluster.snapshot(namespace, name);
         this.store.touch(run.id);
-        log(`deployment.apps/${name} configured (revision ${run.revision})`);
+        log(`deployment.apps/${name} configured (revision ${run.revision}, pacing=${pacing})`);
       });
 
       await this.step(run, 'rollout', (log) => this.runRollout(run, log));
@@ -122,7 +135,11 @@ export class OrchestrationEngine {
 
   // -- step framework -------------------------------------------------------
 
-  private async step(run: Run, id: StepId, fn: (log: (m: string) => void) => Promise<void>): Promise<void> {
+  private async step(
+    run: Run,
+    id: StepId,
+    fn: (log: (m: string) => void) => Promise<void>,
+  ): Promise<void> {
     const step = this.mustStep(run, id);
     step.status = 'running';
     step.startedAt = now();
@@ -141,7 +158,7 @@ export class OrchestrationEngine {
       this.store.touch(run.id);
     } catch (err) {
       step.status = 'failed';
-      step.error = err instanceof Error ? err.message : String(err);
+      step.error = errorMessage(err);
       step.finishedAt = now();
       log(`error: ${step.error}`);
       throw err;
@@ -149,8 +166,11 @@ export class OrchestrationEngine {
   }
 
   private async runRollout(run: Run, log: (m: string) => void): Promise<void> {
-    const { namespace, name, replicas, strategy } = run.spec;
-    log(`strategy=${strategy}; waiting for ${replicas}/${replicas} pods to become ready`);
+    const { namespace, name, replicas } = run.spec;
+    const strategy = STRATEGY_REGISTRY[run.spec.strategy.kind];
+
+    log(`${strategy.label}: waiting for ${replicas}/${replicas} pods to become ready`);
+    for (const line of strategy.plan(run.spec.strategy)) log(`plan: ${line}`);
 
     run.rollout = this.cluster.snapshot(namespace, name);
     const deadline = Date.now() + this.timing.healthTimeoutMs;
@@ -209,15 +229,16 @@ export class OrchestrationEngine {
     const step = this.mustStep(run, 'rollback');
     step.status = 'running';
     step.startedAt = now();
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    step.logs.push(`[${clock()}] triggered by: ${reason}`);
+    step.logs.push(`[${clock()}] triggered by: ${errorMessage(cause)}`);
     this.store.touch(run.id);
     await sleep(this.timing.stepDelayMs);
 
     const restored = this.cluster.rollback(namespace, name);
     if (restored !== undefined) {
       run.rollout = this.cluster.snapshot(namespace, name);
-      step.logs.push(`[${clock()}] restored stable revision ${restored} (${run.rollout.ready}/${run.rollout.desired} ready)`);
+      step.logs.push(
+        `[${clock()}] restored stable revision ${restored} (${run.rollout.ready}/${run.rollout.desired} ready)`,
+      );
       step.status = 'succeeded';
       step.finishedAt = now();
       run.status = 'rolled_back';
@@ -247,7 +268,7 @@ export class OrchestrationEngine {
   }
 }
 
-function summarize(pods: { status: string }[]): string {
+function summarize(pods: readonly Pod[]): string {
   const counts = new Map<string, number>();
   for (const p of pods) counts.set(p.status, (counts.get(p.status) ?? 0) + 1);
   return [...counts.entries()].map(([k, v]) => `${v} ${k}`).join(', ');

@@ -1,4 +1,11 @@
-import type { DeploymentSpec, Pod, PodStatus, RolloutSnapshot } from './types';
+import type {
+  ClusterDriver,
+  DeploymentSpec,
+  FailureMode,
+  Pod,
+  RolloutPacing,
+  RolloutSnapshot,
+} from './types';
 
 /** Thrown when a rollout cannot reach the desired ready state. */
 export class RolloutError extends Error {
@@ -14,6 +21,7 @@ export class RolloutError extends Error {
 interface DeploymentRecord {
   spec: DeploymentSpec;
   revision: number;
+  pacing: RolloutPacing;
   pods: Pod[];
 }
 
@@ -26,8 +34,18 @@ function shortHash(seed: string): string {
   return h.toString(16).padStart(6, '0').slice(0, 5);
 }
 
+function makePods(name: string, revision: number, replicas: number, ready: boolean): Pod[] {
+  const hash = shortHash(`${name}-${revision}`);
+  return Array.from({ length: replicas }, (_, i) => ({
+    name: `${name}-${hash}-${i.toString().padStart(2, '0')}`,
+    status: ready ? 'Ready' : 'Pending',
+    ready,
+    restarts: 0,
+  }));
+}
+
 /**
- * An in-process stand-in for the Kubernetes control plane.
+ * An in-process stand-in for the Kubernetes control plane (a {@link ClusterDriver}).
  *
  * It is intentionally NOT timer-driven: the workflow engine advances pods one
  * `tick()` at a time. That makes rollouts deterministic, observable, and
@@ -35,20 +53,20 @@ function shortHash(seed: string): string {
  * Deployment goes through (Pending -> ContainerCreating -> Running -> Ready,
  * plus the ImagePullBackOff / CrashLoopBackOff / readiness-stall failure paths).
  */
-export class SimulatedCluster {
+export class SimulatedCluster implements ClusterDriver {
   private readonly namespaces = new Set<string>(['default', 'kube-system']);
   private readonly deployments = new Map<string, DeploymentRecord>();
   /** Last successfully promoted revision per deployment, used as a rollback target. */
   private readonly stable = new Map<string, DeploymentRecord>();
 
-  hasNamespace(ns: string): boolean {
-    return this.namespaces.has(ns);
+  hasNamespace(namespace: string): boolean {
+    return this.namespaces.has(namespace);
   }
 
   /** @returns true if the namespace was newly created. */
-  ensureNamespace(ns: string): boolean {
-    if (this.namespaces.has(ns)) return false;
-    this.namespaces.add(ns);
+  ensureNamespace(namespace: string): boolean {
+    if (this.namespaces.has(namespace)) return false;
+    this.namespaces.add(namespace);
     return true;
   }
 
@@ -57,33 +75,29 @@ export class SimulatedCluster {
   }
 
   /** Create/replace the Deployment record with pods not yet scheduled. */
-  applyDeployment(spec: DeploymentSpec, revision: number): void {
-    const hash = shortHash(`${spec.name}-${revision}`);
-    const pods: Pod[] = Array.from({ length: spec.replicas }, (_, i) => ({
-      name: `${spec.name}-${hash}-${i.toString().padStart(2, '0')}`,
-      status: 'Pending' as PodStatus,
-      ready: false,
-      restarts: 0,
-    }));
-    this.deployments.set(keyOf(spec.namespace, spec.name), { spec, revision, pods });
+  applyDeployment(spec: DeploymentSpec, revision: number, pacing: RolloutPacing): void {
+    this.deployments.set(keyOf(spec.namespace, spec.name), {
+      spec,
+      revision,
+      pacing,
+      pods: makePods(spec.name, revision, spec.replicas, false),
+    });
   }
 
   /**
-   * Advance the rollout by one step.
-   *
-   * RollingUpdate brings pods up gradually (one fresh pod starts per tick);
-   * Recreate brings them all up together. Returns true while progress is still
-   * possible, false once every pod is in a terminal state (ready or backoff).
+   * Advance the rollout by one step. `gradual` pacing brings one fresh pod up
+   * per tick (RollingUpdate); `parallel` brings them all up together (Recreate
+   * / Blue-Green). Returns true while progress is still possible, false once
+   * every pod is in a terminal state (ready or backoff).
    */
   tick(namespace: string, name: string): boolean {
     const rec = this.mustGet(namespace, name);
-    const rolling = rec.spec.strategy === 'RollingUpdate';
+    const gradual = rec.pacing === 'gradual';
 
     let startedThisTick = false;
     for (const pod of rec.pods) {
-      // RollingUpdate: only let one not-yet-started pod begin per tick.
       if (pod.status === 'Pending') {
-        if (rolling && startedThisTick) continue;
+        if (gradual && startedThisTick) continue;
         pod.status = 'ContainerCreating';
         startedThisTick = true;
         continue;
@@ -94,12 +108,12 @@ export class SimulatedCluster {
     return rec.pods.some((p) => isProgressing(p));
   }
 
-  private advancePod(pod: Pod, failureMode: DeploymentSpec['failureMode']): void {
+  private advancePod(pod: Pod, failureMode: FailureMode): void {
     switch (pod.status) {
       case 'ContainerCreating':
         if (failureMode === 'image-pull') {
           pod.status = 'ImagePullBackOff';
-          pod.reason = `Failed to pull image: not found in registry`;
+          pod.reason = 'Failed to pull image: not found in registry';
         } else {
           pod.status = 'Running';
         }
@@ -121,7 +135,11 @@ export class SimulatedCluster {
       case 'CrashLoopBackOff':
         pod.restarts += 1;
         return;
-      default:
+      // Pending is handled in tick(); the rest are terminal — nothing to advance.
+      case 'Pending':
+      case 'Ready':
+      case 'ImagePullBackOff':
+      case 'Terminating':
         return;
     }
   }
@@ -141,8 +159,7 @@ export class SimulatedCluster {
   promote(namespace: string, name: string): void {
     const rec = this.mustGet(namespace, name);
     this.stable.set(keyOf(namespace, name), {
-      spec: rec.spec,
-      revision: rec.revision,
+      ...rec,
       pods: rec.pods.map((p) => ({ ...p })),
     });
   }
@@ -159,14 +176,10 @@ export class SimulatedCluster {
       this.deployments.delete(key);
       return undefined;
     }
-    const hash = shortHash(`${prev.spec.name}-${prev.revision}`);
-    const pods: Pod[] = Array.from({ length: prev.spec.replicas }, (_, i) => ({
-      name: `${prev.spec.name}-${hash}-${i.toString().padStart(2, '0')}`,
-      status: 'Ready',
-      ready: true,
-      restarts: 0,
-    }));
-    this.deployments.set(key, { spec: prev.spec, revision: prev.revision, pods });
+    this.deployments.set(key, {
+      ...prev,
+      pods: makePods(prev.spec.name, prev.revision, prev.spec.replicas, true),
+    });
     return prev.revision;
   }
 
@@ -188,7 +201,10 @@ function isProgressing(pod: Pod): boolean {
     case 'Running':
       return !pod.ready;
     // Ready / ImagePullBackOff / CrashLoopBackOff / Terminating are terminal here.
-    default:
+    case 'Ready':
+    case 'ImagePullBackOff':
+    case 'CrashLoopBackOff':
+    case 'Terminating':
       return false;
   }
 }
