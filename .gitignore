@@ -10,3 +10,5 @@ out/
 .env.local
 coverage/
 .claude/
+.idea/
+.vscode/

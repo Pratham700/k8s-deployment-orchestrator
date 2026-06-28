@@ -1,0 +1,35 @@
+# Example kdo config — declare one or more deployments, then:
+#   pnpm kdo apply -f examples/deployments.yaml
+#
+# (Start the API first: pnpm --filter @kdo/api dev)
+# Override the API URL with --api <url> or the KDO_API env var.
+
+apiBaseUrl: http://localhost:3001
+
+deployments:
+  # A healthy rolling update.
+  - name: checkout-api
+    namespace: demo
+    image: ghcr.io/acme/checkout:1.4.2
+    replicas: 3
+    strategy:
+      kind: RollingUpdate
+
+  # A canary (mechanics planned — the rollout logs the plan and progresses).
+  - name: search-api
+    namespace: demo
+    image: ghcr.io/acme/search:2.0.0
+    replicas: 4
+    strategy:
+      kind: Canary
+      trafficPercent: 20
+      bakeSeconds: 60
+
+  # Deliberately broken: exercises the health gate + automatic rollback.
+  - name: payments-api
+    namespace: demo
+    image: ghcr.io/acme/payments:9.9.9
+    replicas: 3
+    failureMode: crash-loop
+    strategy:
+      kind: RollingUpdate

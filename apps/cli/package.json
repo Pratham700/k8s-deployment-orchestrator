@@ -1,0 +1,21 @@
+{
+  "name": "@kdo/cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "kdo": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@kdo/core": "workspace:*",
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  }
+}

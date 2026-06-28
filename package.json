@@ -13,7 +13,8 @@
     "test": "nx run-many --target=test --all",
     "typecheck": "nx run-many --target=typecheck --all",
     "lint": "nx run-many --target=lint --all",
-    "verify": "nx run-many --target=typecheck,test,build --all"
+    "verify": "nx run-many --target=typecheck,test,build --all",
+    "kdo": "tsx apps/cli/src/index.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
