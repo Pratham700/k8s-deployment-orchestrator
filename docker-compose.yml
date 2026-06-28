@@ -1,0 +1,40 @@
+# One command, zero local installs:
+#
+#   docker compose up --build
+#
+# `web` waits for `api` to be healthy before starting — the same
+# infra-before-app ordering the Nx `serve` target enforces locally. Both
+# services run from a single image built once (tagged kdo-app).
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: kdo-app
+    command: ['pnpm', '--filter', '@kdo/api', 'start']
+    environment:
+      PORT: '3001'
+      KDO_API_KEY: kdo-dev-key-2026
+    ports:
+      - '3001:3001'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3001/api/health']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  web:
+    # Reuses the image built by the `api` service (same Dockerfile).
+    image: kdo-app
+    command: ['pnpm', '--filter', '@kdo/web', 'start']
+    environment:
+      # Baked into the client bundle at build time; the browser reaches the API
+      # on the host-mapped port.
+      NEXT_PUBLIC_API_BASE: http://localhost:3001
+    ports:
+      - '3000:3000'
+    depends_on:
+      api:
+        condition: service_healthy
