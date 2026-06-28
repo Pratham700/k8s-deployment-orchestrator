@@ -1,0 +1,12 @@
+{
+  // Next.js rewrites tsconfig.json on every build (re-adding `.next/types`),
+  // which races with a parallel `tsc` typecheck. This dedicated config — which
+  // Next does not touch — excludes generated build output so `nx typecheck`
+  // is deterministic alongside `nx build`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", ".next"]
+}

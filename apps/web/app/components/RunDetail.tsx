@@ -1,8 +1,15 @@
 'use client';
 
 import { useState } from 'react';
-import type { Pod, Run, Step } from '@kdo/core';
+import type { DeploymentStrategy, Pod, Run, Step } from '@kdo/core';
 import { StatusBadge } from './StatusBadge';
+
+function formatStrategy(strategy: DeploymentStrategy): string {
+  if (strategy.kind === 'Canary') {
+    return `Canary (${strategy.trafficPercent}% / bake ${strategy.bakeSeconds}s)`;
+  }
+  return strategy.kind;
+}
 
 function duration(step: Step): string {
   if (!step.startedAt) return '';
@@ -26,7 +33,7 @@ function podClass(status: Pod['status']): string {
   }
 }
 
-function PodGrid({ pods }: { pods: Pod[] }) {
+function PodGrid({ pods }: { pods: readonly Pod[] }) {
   return (
     <div className="pods">
       {pods.map((pod) => (
@@ -102,7 +109,7 @@ export function RunDetail({ run }: { run: Run | null }) {
 
       <div style={{ padding: '0 14px 14px' }}>
         <div className="dur" style={{ marginBottom: 4 }}>
-          replicas ready {ready}/{desired}
+          strategy {formatStrategy(run.spec.strategy)} · replicas ready {ready}/{desired}
         </div>
         <div className="progress">
           <span style={{ width: `${pct}%` }} />
