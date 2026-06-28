@@ -8,28 +8,31 @@ behind **kdo**. For setup and usage, see the [README](../README.md).
 Three layers, each with a single responsibility and a clean boundary:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  @kdo/web  (Next 15 / React 19)                                       │
-│  • DeployForm → POST spec        • RunList / RunDetail → render state  │
-│  • EventSource → live updates    • NO business logic                  │
-└───────────────┬───────────────────────────────────────────────────────┘
-                │ HTTP: fetch (REST) + EventSource (SSE)   [CORS]
-┌───────────────▼───────────────────────────────────────────────────────┐
-│  @kdo/api  (Hono / Node 22)                                            │
-│  • Zod-validate spec at the boundary   • route + stream                │
-│  • createRun() then execute() async    • thin; no domain logic         │
-└───────────────┬───────────────────────────────────────────────────────┘
+┌────────────────────────────────────┐   ┌────────────────────────────────────┐
+│  @kdo/web (Next 15 / React 19)      │   │  @kdo/cli (`kdo apply -f`)          │
+│  operator console, live via SSE     │   │  YAML config, CI exit codes         │
+└──────────────────┬──────────────────┘   └──────────────────┬──────────────────┘
+                   │ fetch (REST) + EventSource (SSE)         │ fetch (REST)
+                   └────────────────────┬─────────────────────┘            [CORS]
+┌───────────────────────────────────────▼───────────────────────────────────────┐
+│  @kdo/api  (Hono / Node 22)                                                    │
+│  • Zod-validate spec at the boundary   • route + stream   • thin, no domain    │
+└───────────────────────────────────────┬───────────────────────────────────────┘
                 │ in-process calls
-┌───────────────▼───────────────────────────────────────────────────────┐
-│  @kdo/core  (pure TypeScript, no I/O)                                  │
-│                                                                        │
-│   OrchestrationEngine ──tick()──▶ SimulatedCluster                     │
-│     │  workflow state machine        pod lifecycle + failure injection │
-│     │  mutates Run, store.touch()                                      │
-│     ▼                                                                  │
-│   RunStore  (Map + EventEmitter)  ──subscribe()──▶ (SSE in the API)    │
-└───────────────────────────────────────────────────────────────────────┘
+┌───────────────▼───────────────────────────────────────────────────────────────┐
+│  @kdo/core  (pure TypeScript, no I/O)                                          │
+│                                                                                │
+│   OrchestrationEngine ──tick()──▶  ClusterDriver  (interface)                  │
+│     │  workflow state machine          ▲   implemented today by SimulatedCluster│
+│     │  consults STRATEGY_REGISTRY      └── future: KubernetesDriver / Argo GitOps│
+│     │  mutates Run, store.touch()                                              │
+│     ▼                                                                          │
+│   RunStore  (Map + EventEmitter)  ──subscribe()──▶ (SSE in the API)            │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Two clients, one API, one engine, one `DeploymentSpec` schema. The engine depends on the
+`ClusterDriver` *interface*, never the concrete simulator.
 
 Why this split: the **engine and cluster are pure and I/O-free**, so they're unit-testable with
 injected timing and have no idea an HTTP server or browser exists. The API is a replaceable
@@ -76,6 +79,27 @@ The rollout step ticks until either all pods are ready (**success**), no pod can
 progress (**fail fast** — image-pull/crash-loop), or the health-gate budget elapses (**timeout** —
 readiness stall). On `promote`, the current revision is snapshotted as the **stable** fallback target;
 `rollback` restores it.
+
+### Strategies (the extension point)
+
+`DeploymentStrategy` is a discriminated union and every strategy has one entry in `STRATEGY_REGISTRY`:
+
+```ts
+interface StrategyDescriptor {
+  kind: StrategyKind;
+  label: string;
+  executable: boolean;              // are the strategy's mechanics built?
+  pacing: 'gradual' | 'parallel';   // how the cluster brings pods up
+  plan(strategy): readonly string[]; // human plan, surfaced in the rollout log
+}
+```
+
+The engine reads the descriptor — it never branches on the strategy string. `RollingUpdate` and
+`Recreate` are `executable`. `BlueGreen` and `Canary` are `executable: false`: fully typed, validated
+(Canary requires `trafficPercent` + `bakeSeconds`), rendered into manifest annotations, and shown in
+the UI/CLI — but their traffic mechanics aren't built yet, so the rollout logs their `plan()` ("not
+enforced in this build") and runs a progressive bring-up. Implementing one later means filling in a
+descriptor + a rollout branch, not reworking the engine.
 
 ## 3. API layer
 
@@ -127,7 +151,7 @@ a durable store (Postgres/Redis) would drop in.
 
 | Decision | Alternative | Why this way |
 |---|---|---|
-| Simulated cluster | real `kind` cluster | zero-setup evaluation, deterministic tests; kept behind a swappable class |
+| Simulated cluster | real `kind` cluster | zero-setup evaluation, deterministic tests; behind the swappable `ClusterDriver` interface |
 | In-memory store | Postgres/Redis | right size for a single-node demo; tiny interface to swap later |
 | SSE | WebSockets / polling | one-way server→client, simpler, proxy-friendly, auto-reconnect |
 | `tsx` runtime, typecheck-as-build | compiled `dist` | removes a build step + monorepo path-resolution pain locally |
@@ -135,10 +159,45 @@ a durable store (Postgres/Redis) would drop in.
 | Fire-and-forget `execute()` | await + long request | fast response; long workflow observed via SSE/polling |
 | Failure injection as a spec field | separate chaos endpoint | every failure path is reproducible in one click for the demo |
 
-## 6. Testing strategy
+## 6. GitOps readiness (designed for, not built)
 
-- **Engine** (`packages/core/src/engine.test.ts`) — happy path, all three failure modes, and
-  rollback-to-previous-revision, all on `FAST_TIMING` so they run in milliseconds.
-- **API** (`apps/api/src/app.test.ts`) — health, `400` validation, `202` + drive-to-success, `404`,
-  via `app.request()` (no network).
+The tool is shaped so an Argo CD / GitOps backend is an addition, not a rewrite:
+
+- **The seam is the `ClusterDriver` interface.** Today `SimulatedCluster` implements it. A
+  `GitOpsClusterDriver` would, behind the same methods, render the manifest → commit it to a Git repo
+  (or upsert an Argo `Application`) → and translate Argo's sync/health status back into the same
+  `RolloutSnapshot` the engine already consumes. The workflow, store, API, and UI stay untouched.
+- **The manifest is already the GitOps artifact.** `renderDeploymentManifest` emits the recommended
+  `app.kubernetes.io/{name,version,managed-by}` labels and `kdo.dev/*` annotations (incl. canary
+  weight/bake), and is exposed at `GET /api/deployments/:id/manifest` — ready to be committed/diffed.
+- **Declarative input.** A `DeploymentSpec` is a serializable declaration, and the CLI already drives
+  the system from a YAML file — the same shape a GitOps reconciler would consume.
+
+## 7. CLI as a first-class client
+
+`@kdo/cli` (`kdo apply -f`) is not a separate code path to the engine: it is an HTTP client of the
+same API the UI uses. It loads a YAML config, validates it with the **shared** `DeploymentSpecSchema`,
+submits each deployment, and polls to a terminal state, printing steps as they settle. It exits `0`
+(all succeeded), `1` (a rollout failed/rolled back), or `2` (usage/connection) so it fits a CI gate.
+Keeping the API as the single control plane is what makes the UI and CLI behave identically.
+
+## 8. Type safety
+
+- **Branded `RunId`** (`string & { __brand }`) — a plain string can't be passed where a run id is
+  expected; `asRunId()` is the one sanctioned crossing point, used at the HTTP boundary.
+- **Discriminated unions + `assertNever`** — strategy and pod-status switches fail to compile if a new
+  variant isn't handled.
+- **`readonly` state + defensive copies** — `RolloutSnapshot`/`Pod` are readonly and the cluster
+  returns copies, so serialized run state can't be mutated by a consumer.
+- **Zod at every boundary** — the spec is parsed (not cast) in the API and the CLI; `any` is absent and
+  `unknown` appears only where it's correct (caught errors, parsed JSON) and is then narrowed.
+- **Compiler**: `strict`, `noUncheckedIndexedAccess`, `noImplicitReturns`,
+  `noFallthroughCasesInSwitch`, `noUnusedLocals/Parameters`.
+
+## 9. Testing strategy
+
+- **Engine** (`packages/core/src/engine.test.ts`, 12 tests) — happy path, Recreate, all three failure
+  modes, rollback-to-previous-revision, Canary plan logging, manifest annotations, and spec validation.
+- **API** (`apps/api/src/app.test.ts`) — health, `400` validation, `202` + drive-to-success, `404`.
+- **CLI** (`apps/cli/src/config.test.ts`) — config parsing, schema defaults, invalid-canary rejection.
 - **Determinism** comes from the tick-based cluster + injectable `Timing`: no sleeps, no flakes.

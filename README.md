@@ -45,23 +45,45 @@ demand against the in-process cluster simulator:
 Deploy once with `none` (promotes revision 1), then again with `crash-loop`, and you'll watch it
 fail and **restore revision 1** — the full safe-deploy story.
 
+### Deployment strategies (extensible)
+
+The strategy is a discriminated union backed by a single `STRATEGY_REGISTRY`, so adding one is a
+single entry rather than scattered conditionals:
+
+| Strategy | Status | Behaviour |
+|---|---|---|
+| `RollingUpdate` | executable | surge one pod at a time |
+| `Recreate` | executable | bring all pods up together |
+| `BlueGreen` | typed/validated; **mechanics planned** | rollout logs the plan, runs a progressive bring-up |
+| `Canary` | typed/validated; **mechanics planned** | requires `trafficPercent` + `bakeSeconds`; plan is logged |
+
+Blue-Green and Canary are intentionally **not yet executed** as traffic-management mechanisms — they
+are fully modelled (types, Zod validation, UI inputs, manifest annotations, registry) so the feature
+is a drop-in later. Selecting Canary in the UI reveals its **traffic %** and **bake period** inputs;
+the rendered manifest records the intent as `kdo.dev/strategy: Canary` + `kdo.dev/canary-*`
+annotations — exactly how a rollout controller (e.g. Argo Rollouts) would discover them.
+
 ---
 
 ## Architecture at a glance
 
 ```
-  Browser — Next 15 / React 19 operator console
-     │  fetch (REST)  +  EventSource (Server-Sent Events)
-     ▼
-  @kdo/api — Hono on Node 22
-     │  createRun() → execute() [async, fire-and-forget]
-     ▼
+  Operator console (Next/React)          kdo CLI (YAML config, CI)
+        │  fetch + EventSource (SSE)            │  fetch (REST), exit codes
+        └───────────────┬──────────────────────┘
+                        ▼
+  @kdo/api — Hono on Node 22   (the single control plane)
+        │  createRun() → execute() [async, fire-and-forget]
+        ▼
   @kdo/core
-     ├── OrchestrationEngine ── tick() ──▶ SimulatedCluster   (pod lifecycle + failure injection)
+     ├── OrchestrationEngine ──tick()──▶ ClusterDriver  ◀── SimulatedCluster (today)
+     │        │ consults STRATEGY_REGISTRY                  └─ KubernetesDriver / Argo GitOps (future)
      │        │ mutates run state + store.touch()
      │        ▼
-     └── RunStore  (in-memory Map + EventEmitter)  ── subscribe() ──▶  SSE stream back to the browser
+     └── RunStore (in-memory Map + EventEmitter) ──subscribe()──▶ SSE stream back to clients
 ```
+
+Two clients (UI + CLI), one API, one engine, one validation schema — that uniformity is deliberate.
 
 - **UI** initiates a run and renders live progress; it holds **zero** business logic.
 - **API** is a thin, well-typed HTTP boundary (validation + routing + streaming).
@@ -80,8 +102,14 @@ A full write-up — data model, state transitions, and the key trade-offs — is
 | Backend | **Hono 4** + `@hono/node-server` | tiny, fast, first-class streaming (SSE); Lambda-portable |
 | Validation | **Zod** | spec is validated once at the API boundary; types inferred from the schema |
 | Frontend | **Next 15** (App Router) + **React 19** | required stack; minimal hand-rolled UI, no component library |
+| CLI | **TypeScript** + **yaml** + **zod** | config-file driven, HTTP client to the API, CI exit codes |
 | Tests | **Vitest** | fast; deterministic engine tests via injectable timing |
 | Runtime | **Node 22** (pinned via `mise` / `.nvmrc`) | matches the brief |
+
+Type safety throughout: `strict` + `noUncheckedIndexedAccess` + `noImplicitReturns` +
+`noFallthroughCasesInSwitch` + `noUnusedLocals/Parameters`, a branded `RunId`, discriminated unions
+with `assertNever` exhaustiveness guards, and Zod at every external boundary (no `any`; `unknown` only
+where it's correct — caught errors and parsed JSON — then narrowed).
 
 ---
 
@@ -121,6 +149,7 @@ Base URL: `http://localhost:3001`
 | `GET` | `/api/deployments` | list runs (newest first) |
 | `POST` | `/api/deployments` | submit a spec → `202` with the created run (executes async) |
 | `GET` | `/api/deployments/:id` | full run state (polling fallback) |
+| `GET` | `/api/deployments/:id/manifest` | rendered Deployment YAML (the GitOps artifact) |
 | `GET` | `/api/deployments/:id/events` | **SSE** stream of live run state; emits a terminal `done` event |
 
 **Submit a deployment:**
@@ -134,15 +163,43 @@ curl -X POST localhost:3001/api/deployments \
 An invalid spec returns `400` with structured Zod issues (e.g. an image without an explicit tag,
 replicas outside `1..10`, or a non-DNS-1123 name).
 
+## CLI — config-file driven (for engineers & CI)
+
+The UI is for operators; the CLI is the same workflow for technical users, scripts, and CI. It reads
+a YAML config (validated against the **same** Zod schema as the API/UI), submits each deployment, and
+follows it to a terminal state — exiting non-zero if any rollout fails.
+
+```bash
+# start the API first (pnpm --filter @kdo/api dev), then:
+pnpm kdo apply -f examples/deployments.yaml
+```
+
+```
+▶ demo/checkout-api (ghcr.io/acme/checkout:1.4.2, RollingUpdate)
+  ✓ Validate spec 451ms
+  ✓ Roll out pods 2.7s
+  ✓ Promote revision 452ms
+  · Rollback (skipped)
+  succeeded — Revision 1 live — 3/3 replicas ready
+...
+✓ all 3 deployment(s) succeeded
+```
+
+Flags: `--api <url>` (or `$KDO_API`), `--json` (machine-readable output), `--no-follow` (fire and
+exit). **Exit codes:** `0` all succeeded · `1` a rollout failed/rolled back · `2` usage/connection
+error — so `kdo apply` drops straight into a CI gate.
+
 ## Project structure
 
 ```
 k8s-deploy-orchestrator/
 ├── apps/
 │   ├── api/            @kdo/api  — Hono REST + SSE (thin HTTP boundary)
-│   └── web/            @kdo/web  — Next 15 operator console
+│   ├── web/            @kdo/web  — Next 15 operator console
+│   └── cli/            @kdo/cli  — `kdo apply -f` config-driven client (CI)
 ├── packages/
-│   └── core/           @kdo/core — engine, simulated cluster, store, types (the brains)
+│   └── core/           @kdo/core — engine, simulated cluster, store, strategy registry, types
+├── examples/deployments.yaml
 ├── docs/ARCHITECTURE.md
 ├── AI_LOG.md           — how this was built with AI (interaction log)
 ├── nx.json · tsconfig.base.json · pnpm-workspace.yaml · eslint.config.mjs
@@ -174,20 +231,27 @@ full transition diagram.
   code leaks into the browser bundle (105 kB first load).
 - **Failure injection is a spec field.** Pragmatic way to make every failure path reproducible in a
   demo without breaking real inputs.
+- **Extension via seams, not rewrites.** The `ClusterDriver` interface and the `STRATEGY_REGISTRY`
+  mean a real K8s/Argo backend or a new strategy is an addition, not a refactor — uniformity by design.
+- **Type safety as a guardrail.** Branded ids, discriminated unions + `assertNever`, `readonly` state,
+  and Zod boundaries mean whole classes of mistakes (mixed-up ids, unhandled strategy, mutated
+  snapshots) fail to compile rather than at runtime.
 
 ## What I'd build next
 
-Given more time, in priority order:
+The codebase already has the seams; these fill them in (priority order):
 
-1. **Real cluster adapter** — implement the `SimulatedCluster` interface with `@kubernetes/client-node`
+1. **Real cluster driver** — implement the `ClusterDriver` interface with `@kubernetes/client-node`
    against a local `kind` cluster; select via env. The engine wouldn't change.
-2. **Durable state** — swap `RunStore` for Postgres so runs survive restarts; add run history/audit.
-3. **Manual controls** — a "Roll back now" button and "Pause/Resume rollout" (the engine is already
-   step-structured for this).
-4. **Canary / progressive traffic** — extend the strategy model beyond RollingUpdate/Recreate to a
-   percentage-based canary with metric-based promotion.
-5. **Concurrency guard** — reject/queue a second in-flight rollout for the same namespace/name.
-6. **AuthN/Z + multi-tenant namespaces**, and structured logging/metrics on the API.
+2. **Argo CD / GitOps driver** — a `ClusterDriver` that renders the manifest, commits it to a Git repo,
+   and reads back Argo `Application` sync/health status instead of applying directly. The manifest
+   already carries the `app.kubernetes.io/*` + `kdo.dev/*` labels Argo/rollout-controllers key on.
+3. **Execute Canary / Blue-Green** — the types, validation, UI, manifest annotations, and registry are
+   in place; implement the traffic-shift + bake-gate mechanics behind the existing strategy descriptor.
+4. **Durable state** — swap `RunStore` for Postgres so runs survive restarts; add history/audit.
+5. **Manual controls** — "Roll back now" / "Pause-Resume rollout" (the engine is already step-structured).
+6. **Concurrency guard** — reject/queue a second in-flight rollout for the same namespace/name.
+7. **AuthN/Z + multi-tenant namespaces**, and structured logging/metrics on the API.
 
 ## AI collaboration
 
