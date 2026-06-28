@@ -115,21 +115,39 @@ where it's correct — caught errors and parsed JSON — then narrowed).
 
 ## Quickstart
 
-**Prerequisites:** Node 22 and pnpm 10. (`mise install` will read `mise.toml` and set both up;
-otherwise use your own version manager — `.nvmrc` pins Node 22.) **No cloud account, cluster, or API
-key is required** — the Kubernetes control plane is simulated in-process.
+**No cloud account, cluster, or API key is required** — the Kubernetes control plane is simulated
+in-process. Pick whichever path you prefer:
+
+### Option A — Docker (zero local installs)
+
+Only Docker is required. One command builds the image and starts both services:
 
 ```bash
-pnpm install          # install workspace deps
-pnpm dev              # starts the API (:3001) and the web console (:3000) together
+docker compose up --build
 ```
+
+`web` waits for `api` to report healthy before it starts (Compose `depends_on: service_healthy`).
+Then open **http://localhost:3000**.
+
+### Option B — Node + Nx (one command)
+
+**Prerequisites:** Node 22 + pnpm 10 (`mise install` reads `mise.toml`; `.nvmrc` pins Node 22).
+A single command installs, builds, and starts both servers **in order** (api → health-gate → web):
+
+```bash
+pnpm start
+```
+
+This runs the Nx `@kdo/web:serve` target, whose `dependsOn` builds `@kdo/core`, `@kdo/api`, and
+`@kdo/web` first (the same "build the infra before the app" ordering an IDP uses), then an
+orchestrator starts the API, waits for `/api/health`, and only then starts the web console.
 
 Then open **http://localhost:3000**. The login form pre-fills the demo API key — pick a role
 (start with **Platform Team**) and sign in, then click **Deploy**. See [Authentication &
 RBAC](#authentication--rbac-deliberately-simple).
 
-> `pnpm dev` runs both apps via `nx run-many`. To run them separately:
-> `pnpm --filter @kdo/api dev` and `pnpm --filter @kdo/web dev`.
+> For an iterative dev loop with hot reload use `pnpm dev` (both apps via `nx run-many`), or run
+> them separately: `pnpm --filter @kdo/api dev` and `pnpm --filter @kdo/web dev`.
 
 ### Verify / quality gates
 
@@ -222,15 +240,17 @@ rollout failed/rolled back · `2` usage/auth/connection error — so `kdo apply`
 
 ## Project structure
 
+All projects live under `packages/` and are managed by Nx.
+
 ```
 k8s-deploy-orchestrator/
-├── apps/
+├── packages/
+│   ├── core/           @kdo/core — engine, simulated cluster, store, strategy registry, types
 │   ├── api/            @kdo/api  — Hono REST + SSE (thin HTTP boundary)
 │   ├── web/            @kdo/web  — Next 15 operator console
 │   └── cli/            @kdo/cli  — `kdo apply -f` config-driven client (CI)
-├── packages/
-│   └── core/           @kdo/core — engine, simulated cluster, store, strategy registry, types
 ├── examples/deployments.yaml
+├── Dockerfile · docker-compose.yml · .dockerignore
 ├── docs/ARCHITECTURE.md
 ├── AI_LOG.md           — how this was built with AI (interaction log)
 ├── nx.json · tsconfig.base.json · pnpm-workspace.yaml · eslint.config.mjs

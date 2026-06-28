@@ -6,6 +6,7 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
+    "serve": "node ../../scripts/serve.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "lint": "eslint ."
   },

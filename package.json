@@ -8,13 +8,14 @@
     "node": ">=22"
   },
   "scripts": {
+    "start": "pnpm install && pnpm exec nx run @kdo/web:serve",
     "dev": "nx run-many --target=dev --all --parallel=10",
     "build": "nx run-many --target=build --all",
     "test": "nx run-many --target=test --all",
     "typecheck": "nx run-many --target=typecheck --all",
     "lint": "nx run-many --target=lint --all",
     "verify": "nx run-many --target=typecheck,test,build --all",
-    "kdo": "tsx apps/cli/src/index.ts"
+    "kdo": "tsx packages/cli/src/index.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

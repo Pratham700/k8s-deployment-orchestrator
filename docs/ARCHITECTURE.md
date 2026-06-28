@@ -193,7 +193,7 @@ real IdP (out of scope for the assignment). The pieces:
 - **One shared API key** (`KDO_API_KEY`, default `kdo-dev-key-2026`) exchanged at `POST
   /api/auth/login` for an opaque session token; the API holds a `Map<token, role>` (same in-memory,
   reset-on-restart shape as the RunStore).
-- **Two middlewares** (`apps/api/src/auth.ts`): `requireAuth` (valid token → attaches `role` to the
+- **Two middlewares** (`packages/api/src/auth.ts`): `requireAuth` (valid token → attaches `role` to the
   Hono context) guards every `/api/deployments*` route; `requirePermission('deployments:create')`
   gates `POST /api/deployments`. The SSE route reads the token from `?token=` because `EventSource`
   can't send headers.
@@ -221,7 +221,22 @@ the login handler + `requireAuth` for OIDC/JWT and the role→permission map is 
 - **Engine + auth** (`packages/core`, 15 tests) — happy path, Recreate, all three failure modes,
   rollback-to-previous-revision, Canary plan logging, manifest annotations, spec validation, and the
   role→permission matrix.
-- **API** (`apps/api/src/app.test.ts`, 8 tests) — health, login (valid/bad key/bad role),
+- **API** (`packages/api/src/app.test.ts`, 8 tests) — health, login (valid/bad key/bad role),
   unauthenticated `401`, RBAC `403` for a manager + `202` for platform-team, `400` validation, `404`.
-- **CLI** (`apps/cli/src/config.test.ts`) — config parsing, schema defaults, invalid-canary rejection.
+- **CLI** (`packages/cli/src/config.test.ts`) — config parsing, schema defaults, invalid-canary rejection.
 - **Determinism** comes from the tick-based cluster + injectable `Timing`: no sleeps, no flakes.
+
+## 11. Running it — one command, infra before app
+
+The evaluator never builds, installs, or starts the two servers by hand. Two equivalent paths, both
+expressing the **api-before-web** dependency (the IDP "deploy app stack → infra stack first" idea):
+
+- **`pnpm start`** → the Nx `@kdo/web:serve` target. Its `dependsOn` (`nx.json`) builds `@kdo/core`,
+  `@kdo/web`, and `@kdo/api` first; then `scripts/serve.mjs` (zero-dependency Node) starts the API,
+  polls `/api/health`, and only then starts the web console — forwarding Ctrl+C to both.
+- **`docker compose up --build`** → one multi-stage image runs as two services; `web` declares
+  `depends_on: { api: { condition: service_healthy } }`, the Compose-native form of the same gate.
+
+All four projects live under `packages/` and are Nx-managed; there are no `apps/` — a single project
+layout keeps target wiring uniform. The lockfile is pinned to the public npm registry (`.npmrc`) so
+`pnpm install` / the Docker build work on any machine.

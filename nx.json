@@ -29,6 +29,10 @@
     },
     "dev": {
       "cache": false
+    },
+    "serve": {
+      "dependsOn": ["build", { "projects": "@kdo/api", "target": "build" }],
+      "cache": false
     }
   }
 }
